@@ -3,7 +3,8 @@
 This guide demonstrates how to set up Confluent Gateway on AKS (Azure Kubernetes Service) to enable seamless switchover between Confluent Cloud clusters across multiple Azure regions.
 
 ## Architecture Diagram:
-<img width="1540" height="870" alt="image (2)" src="https://github.com/user-attachments/assets/f0721e47-cf64-4e8d-aced-060d30f414f2" />
+<img width="1513" height="542" alt="image" src="https://github.com/user-attachments/assets/0a295121-9c89-44c7-89a4-4f410c3a8bf4" />
+
 
 ---
 
