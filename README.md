@@ -1,4 +1,4 @@
-# Confluent Cloud Gateway Setup for Cluster Switchover (Azure)
+# Confluent Cloud Gateway Setup for Cluster DR Failover (Azure)
 
 This guide demonstrates how to set up Confluent Gateway on AKS (Azure Kubernetes Service) to enable seamless switchover between Confluent Cloud clusters across multiple Azure regions.
 
