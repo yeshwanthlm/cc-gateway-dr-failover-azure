@@ -1,566 +1,1245 @@
-# Confluent Cloud Gateway Setup for Cluster DR Failover (Azure)
+# Confluent Cloud Gateway Setup for Cluster Switchover (Azure)
 
-This guide demonstrates how to set up Confluent Gateway on AKS (Azure Kubernetes Service) to enable seamless switchover between Confluent Cloud clusters across multiple Azure regions.
+Complete Confluent Cloud Gateway deployment on Azure with Standard (Primary) and Dedicated (DR) clusters, cluster linking, and automated failover capabilities.
 
-## Architecture Diagram:
-<img width="1513" height="542" alt="image" src="https://github.com/user-attachments/assets/0a295121-9c89-44c7-89a4-4f410c3a8bf4" />
-
+## Architecture Diagram
+<img width="1540" height="870" alt="image (2)" src="https://github.com/user-attachments/assets/f0721e47-cf64-4e8d-aced-060d30f414f2" />
 
 ---
 
-## 🚀 Quick Start - Automated Deployment
+## 📖 Table of Contents
 
-**Recommended!** Complete automation for deployment and cleanup:
+- [Quick Start (Automated)](#-quick-start-automated) - **Start here for fastest deployment**
+- [Manual Deployment Guide](#-manual-deployment-guide) - **Step-by-step instructions**
+- [Architecture Overview](#-architecture-overview)
+- [Testing & Verification](#-testing--verification)
+- [DR Failover](#-dr-failover)
+- [Cleanup](#-cleanup)
+
+---
+
+## 🚀 Quick Start (Automated)
+
+**Choose this if**: You want a one-command deployment with minimal manual intervention.
+
+### Prerequisites
+
+- [Terraform](https://www.terraform.io/downloads.html) >= 1.0
+- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) (logged in)
+- [kubectl](https://kubernetes.io/docs/tasks/tools/)
+- [Helm](https://helm.sh/docs/intro/install/) >= 3.0
+- OpenSSL and Java KeyTool
+- [Confluent Cloud Account](https://confluent.cloud) with API keys
+
+### Step 1: Azure Login
 
 ```bash
-# 1. Login to Azure
 az login
 az account set --subscription "YOUR_SUBSCRIPTION_ID"
+```
 
-# 2. Get your subscription ID
-az account show --query id -o tsv
+### Step 2: Configure Environment
 
-# 3. Configure environment
+```bash
 cp .env.example .env
 nano .env
-# Add:
-#   AZURE_SUBSCRIPTION_ID=your-subscription-id
-#   OWNER_EMAIL=your.email@company.com
-#   CONFLUENT_CLOUD_API_KEY=your-api-key
-#   CONFLUENT_CLOUD_API_SECRET=your-api-secret
+```
 
-# 4. Deploy everything (~20 minutes)
+**Required configuration:**
+```bash
+AZURE_SUBSCRIPTION_ID=your-subscription-id
+OWNER_EMAIL=your.email@company.com
+AZURE_LOCATION=centralus
+CONFLUENT_CLOUD_API_KEY=your-api-key
+CONFLUENT_CLOUD_API_SECRET=your-api-secret
+GATEWAY_DOMAIN=kafka.cc.axa.com
+```
+
+### Step 3: Deploy Everything
+
+```bash
 ./deploy.sh
+```
 
-# 5. Destroy everything when done (~15 minutes)
+**Deployment time**: ~45-50 minutes
+- AKS Cluster: 10-15 min
+- Primary Cluster (Standard): 3-5 min
+- DR Cluster (Dedicated): 35-45 min
+- Cluster Linking: 2-3 min
+- Gateway & Certificates: 5-10 min
+
+### Step 4: Verify Deployment
+
+```bash
+# Verify cluster linking
+./scripts/verify-cluster-linking.sh
+
+# Check all resources
+kubectl get all -n confluent
+```
+
+### What Gets Deployed
+
+| Component | Details |
+|-----------|---------|
+| **AKS Cluster** | 2 nodes, Kubernetes 1.36, Central US |
+| **Primary Cluster** | Standard type (elastic), East US, `test_topic` + `mirrored_topic` |
+| **DR Cluster** | Dedicated type (1 CKU), West US 2, `test_topic` + `mirrored_topic` (mirror) |
+| **Cluster Link** | `primary-to-dr-link` - Active replication |
+| **Gateway** | Confluent Gateway on AKS with LoadBalancer |
+| **DNS** | Private DNS zone `axa.com` with A record `kafka.cc.axa.com` |
+| **Schema Registry** | Advanced package with public endpoint |
+
+### Gateway Switchover Testing
+
+Complete end-to-end cluster switchover from Primary to DR.
+
+#### Step 1: Deploy
+
+Ensure deployment is complete:
+
+```bash
+# Verify all resources are running
+kubectl get all -n confluent
+
+# Check gateway is routing to Primary
+kubectl get gateway confluent-gateway -n confluent -o yaml | grep "bootstrapServerId:"
+# Expected: bootstrapServerId: CC_PRIMARY
+```
+
+#### Step 2: Produce/Consume to Primary & DR Cluster
+
+```bash
+
+# Produce to mirrored_topic on Primary cluster
+kubectl exec kafka-tools -n confluent -- bash -c \
+  'echo -e "primary-msg-1\nprimary-msg-2\nprimary-msg-3" | kafka-console-producer \
+    --bootstrap-server kafka.cc.axa.com:9092 \
+    --producer.config /etc/kafka/client-primary/client-primary.properties \
+    --topic mirrored_topic'
+
+# Produce to mirrored_topic on DR cluster
+kubectl exec kafka-tools -n confluent -- bash -c \
+  'echo -e "msg-1\nmsg-2\nmsg-3" | kafka-console-producer \
+    --bootstrap-server kafka.cc.axa.com:9092 \
+    --producer.config /etc/kafka/client-dr/client-dr.properties \
+    --topic mirrored_topic'
+```
+
+✅ Expected: Messages replicated from Primary to DR via cluster linking
+
+#### Step 3: Promote Mirror Topic and Switch Gateway to DR
+
+**A. Promote mirrored_topic on DR cluster:**
+
+```bash
+./scripts/failover-mirrored-topic.sh
+# Type 'yes' when prompted to confirm
+```
+
+Or manually:
+```bash
+cd terraform/confluent-cloud
+DR_CLUSTER_ID=$(terraform output -raw dr_cluster_id)
+LINK_NAME=$(terraform output -raw cluster_link_name)
+
+confluent kafka mirror failover mirrored_topic \
+  --link $LINK_NAME \
+  --cluster $DR_CLUSTER_ID
+
+cd ../..
+```
+
+✅ Result: `mirrored_topic` on DR is now **writable** (no longer read-only mirror)
+
+**B. Change gateway route to DR cluster:**
+
+```bash
+# Edit gateway configuration
+nano kubernetes-resources/gateway.yaml
+```
+
+Change lines 50-56:
+```yaml
+# BEFORE (routing to Primary):
+routes:
+  - name: primary-route
+    endpoint: "kafka.cc.axa.com:9092"
+    streamingDomain:
+      name: cc-primary
+      bootstrapServerId: CC_PRIMARY
+
+# AFTER (routing to DR):
+routes:
+  - name: dr-route
+    endpoint: "kafka.cc.axa.com:9092"
+    streamingDomain:
+      name: cc-dr
+      bootstrapServerId: CC_DR
+```
+
+**C. Apply changes and restart gateway:**
+
+```bash
+kubectl delete pod -n confluent -l app=confluent-gateway
+kubectl apply -f kubernetes-resources/gateway.yaml -n confluent
+kubectl wait --for=condition=Ready pod -l app=confluent-gateway -n confluent --timeout=120s
+```
+
+**D. Verify gateway switched:**
+
+```bash
+kubectl get gateway confluent-gateway -n confluent -o yaml | grep "bootstrapServerId:"
+# Expected: bootstrapServerId: CC_DR
+```
+
+✅ Gateway now routing to DR cluster
+
+#### Step 4: Produce to DR Cluster
+
+```bash
+# Produce to mirrored_topic on DR cluster (now writable!)
+kubectl exec kafka-tools -n confluent -- bash -c \
+  'echo -e "dr-msg-1\ndr-msg-2\ndr-msg-3" | kafka-console-producer \
+    --bootstrap-server kafka.cc.axa.com:9092 \
+    --producer.config /etc/kafka/client-dr/client-dr.properties \
+    --topic mirrored_topic'
+
+# Consume to verify
+kubectl exec kafka-tools -n confluent -- kafka-console-consumer \
+  --bootstrap-server kafka.cc.axa.com:9092 \
+  --consumer.config /etc/kafka/client-dr/client-dr.properties \
+  --topic mirrored_topic \
+  --from-beginning \
+  --max-messages 6 \
+  --timeout-ms 10000
+```
+
+✅ Expected: All 6 messages (3 from Primary + 3 from DR)
+
+**🎉 Cluster Switchover Complete!**
+
+You've successfully:
+1. ✅ Produced messages to Primary cluster
+2. ✅ Verified replication to DR via cluster linking
+3. ✅ Promoted mirror topic to writable on DR
+4. ✅ Switched gateway routing from Primary to DR
+5. ✅ Produced messages to DR cluster
+
+**For detailed DR failover documentation**, see the [DR Failover](#-dr-failover) section.
+
+### Cleanup
+
+```bash
 ./destroy.sh
+```
+
+---
+
+## 📖 Manual Deployment Guide
+
+**Choose this if**: You want full control over each deployment step.
+
+### Phase 1: Azure Infrastructure
+
+#### 1.1 Configure Azure
+
+```bash
+# Login
+az login
+az account list --output table
+az account set --subscription "YOUR_SUBSCRIPTION_ID"
+
+# Get subscription ID
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+echo $SUBSCRIPTION_ID
+```
+
+#### 1.2 Configure Environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your values:
+```bash
+AZURE_SUBSCRIPTION_ID=<your-subscription-id>
+OWNER_EMAIL=your.email@company.com
+AZURE_LOCATION=centralus
+CONFLUENT_CLOUD_API_KEY=<your-cloud-api-key>
+CONFLUENT_CLOUD_API_SECRET=<your-cloud-api-secret>
+DNS_ZONE_NAME=axa.com
+GATEWAY_DNS_RECORD_NAME=kafka.cc
+GATEWAY_DOMAIN=kafka.cc.axa.com
+```
+
+#### 1.3 Deploy AKS Cluster
+
+```bash
+cd terraform/aks
+
+# Create terraform.tfvars
+cat > terraform.tfvars <<EOF
+azure_subscription_id   = "$AZURE_SUBSCRIPTION_ID"
+owner_email             = "$OWNER_EMAIL"
+azure_location          = "centralus"
+resource_group_name     = "cc-gateway-rg"
+cluster_name            = "cc-gateway-aks"
+EOF
+
+terraform init
+terraform plan
+terraform apply
+```
+
+**Time**: 10-15 minutes
+
+#### 1.4 Configure kubectl
+
+```bash
+az aks get-credentials \
+  --resource-group cc-gateway-rg \
+  --name cc-gateway-aks \
+  --overwrite-existing
+
+kubectl get nodes
+```
+
+### Phase 2: Confluent Cloud Resources
+
+#### 2.1 Deploy Kafka Clusters
+
+```bash
+cd ../confluent-cloud
+
+# Create terraform.tfvars
+cat > terraform.tfvars <<EOF
+confluent_cloud_api_key    = "$CONFLUENT_CLOUD_API_KEY"
+confluent_cloud_api_secret = "$CONFLUENT_CLOUD_API_SECRET"
+environment_name           = "cc-gateway-demo-azure"
+primary_cluster_name       = "azure-eastus-primary"
+primary_cluster_region     = "eastus"
+dr_cluster_name            = "azure-westus2-dr"
+dr_cluster_region          = "westus2"
+availability               = "SINGLE_ZONE"
+EOF
+
+terraform init
+terraform plan
+terraform apply
+```
+
+**Time**: 45-50 minutes (DR Dedicated cluster takes longest)
+
+**What gets created:**
+- Environment with Schema Registry (Advanced)
+- Primary cluster (Standard) - East US
+- DR cluster (Dedicated, 1 CKU) - West US 2
+- Cluster link: `primary-to-dr-link`
+- Topics: `test_topic` (both clusters), `mirrored_topic` (Primary + DR mirror)
+- Service accounts and API keys
+
+#### 2.2 Save Cluster Details
+
+```bash
+# Save to environment file
+terraform output -raw primary_cluster_bootstrap_endpoint
+terraform output -raw dr_cluster_bootstrap_endpoint
+terraform output -raw schema_registry_endpoint
+
+# View all outputs
+terraform output
+```
+
+### Phase 3: Confluent Operator
+
+#### 3.1 Install Operator
+
+```bash
+cd ../..
+
+# Add Helm repo
+helm repo add confluentinc https://packages.confluent.io/helm
+helm repo update
+
+# Create namespace
+kubectl create namespace confluent
+
+# Install operator
+helm upgrade --install confluent-operator \
+  confluentinc/confluent-for-kubernetes \
+  --namespace confluent \
+  --wait
+```
+
+#### 3.2 Verify Operator
+
+```bash
+kubectl wait --for=condition=Ready pod \
+  -l app=confluent-operator \
+  -n confluent \
+  --timeout=300s
+
+kubectl get pods -n confluent
+```
+
+### Phase 4: Certificates and Secrets
+
+#### 4.1 Generate Certificates
+
+```bash
+# Create all certificates
+make certs
+
+# Verify
+make verify-certs
+```
+
+#### 4.2 Create Kubernetes Secrets
+
+```bash
+make k8s-secrets
+
+# Verify all secrets exist
+kubectl get secrets -n confluent | grep -E "tls|client"
+```
+
+**Expected secrets:**
+- `cc-primary-tls`
+- `cc-dr-tls`
+- `gateway-tls`
+- `gateway-truststore`
+- `client-primary`
+- `client-dr`
+
+### Phase 5: Deploy Gateway
+
+#### 5.1 Get LoadBalancer IP
+
+Wait for LoadBalancer service to get an external IP (created by gateway deployment):
+
+```bash
+# Deploy gateway
+kubectl apply -f kubernetes-resources/gateway.yaml -n confluent
+
+# Wait for LoadBalancer
+kubectl wait --for=condition=Ready pod \
+  -l app=confluent-gateway \
+  -n confluent \
+  --timeout=600s
+
+# Get IP (wait up to 5 minutes)
+LB_IP=""
+for i in {1..60}; do
+  LB_IP=$(kubectl get svc confluent-gateway-bootstrap-lb -n confluent \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  if [ -n "$LB_IP" ]; then
+    echo "LoadBalancer IP: $LB_IP"
+    break
+  fi
+  echo "Waiting for LoadBalancer IP... ($i/60)"
+  sleep 5
+done
+```
+
+#### 5.2 Update DNS Record
+
+```bash
+# Update DNS A record
+az network private-dns record-set a add-record \
+  --resource-group cc-gateway-rg \
+  --zone-name axa.com \
+  --record-set-name kafka.cc \
+  --ipv4-address $LB_IP
+
+# Verify
+az network private-dns record-set a show \
+  --resource-group cc-gateway-rg \
+  --zone-name axa.com \
+  --name kafka.cc
+```
+
+### Phase 6: Deploy Kafka Tools
+
+```bash
+kubectl apply -f kubernetes-resources/kafka-tools.yaml -n confluent
+
+kubectl wait --for=condition=Ready pod/kafka-tools \
+  -n confluent \
+  --timeout=120s
+```
+
+### Phase 7: Verify Deployment
+
+```bash
+# Check all pods
+kubectl get pods -n confluent
+
+# Check gateway
+kubectl get gateway confluent-gateway -n confluent
+
+# Test connectivity
+kubectl exec kafka-tools -n confluent -- kafka-topics \
+  --bootstrap-server kafka.cc.axa.com:9092 \
+  --command-config /etc/kafka/client-primary/client-primary.properties \
+  --list
 ```
 
 ---
 
 ## 🏗️ Architecture Overview
 
-**Complete Azure Multi-Region Deployment**
+### Infrastructure Components
 
-This repository deploys a fully automated Confluent Cloud Gateway infrastructure across **3 Azure regions**:
+**3 Azure Regions:**
+- **Central US**: AKS cluster, Gateway
+- **East US**: Primary Kafka cluster (Standard)
+- **West US 2**: DR Kafka cluster (Dedicated, 1 CKU)
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      AZURE CLOUD                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  🌐 Region 1: East US (eastus)                             │
-│  ┌────────────────────────────────────────┐                │
-│  │ Primary Confluent Cloud Kafka Cluster  │                │
-│  │ - Bootstrap: pkc-xxxxx.eastus.azure... │                │
-│  │ - Service Account + API Keys            │                │
-│  │ - CloudClusterAdmin Role                │                │
-│  └────────────────────────────────────────┘                │
-│                                                              │
-│  🌐 Region 2: West US 2 (westus2)                          │
-│  ┌────────────────────────────────────────┐                │
-│  │ DR Confluent Cloud Kafka Cluster       │                │
-│  │ - Bootstrap: pkc-yyyyy.westus2.azure...│                │
-│  │ - Service Account + API Keys            │                │
-│  │ - CloudClusterAdmin Role                │                │
-│  └────────────────────────────────────────┘                │
-│                                                              │
-│  🌐 Region 3: Central US (centralus)                       │
-│  ┌────────────────────────────────────────┐                │
-│  │ AKS Cluster (Kubernetes 1.36)          │                │
-│  │ ├─ Confluent Gateway Pods              │                │
-│  │ ├─ Kafka Tools Pod                     │                │
-│  │ ├─ LoadBalancer Service                │                │
-│  │ └─ Azure Private DNS Zone (axa.com)    │                │
-│  │    • A Record: kafka.cc.axa.com       │                │
-│  └────────────────────────────────────────┘                │
-│                                                              │
-│  📍 Gateway Endpoint: kafka.cc.axa.com:9092               │
-│  🔐 Azure Private DNS Zone: axa.com                         │
-│  🔄 Seamless Switchover: Primary ⟷ DR                      │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+### Cluster Configuration
 
-### Key Architecture Features
+| Feature | Primary (Standard) | DR (Dedicated) |
+|---------|-------------------|----------------|
+| **Type** | Standard | Dedicated |
+| **Region** | East US | West US 2 |
+| **Capacity** | Elastic, auto-scaling | Fixed (1 CKU) |
+| **Throughput** | Up to 100 MB/s | 100 MB/s per CKU |
+| **SLA** | 99.9% | 99.95% |
+| **Network** | Shared | Isolated VPC |
+| **Monthly Cost** | ~$50-100 (variable) | ~$500 (fixed) |
 
-- **All on Azure**: No cross-cloud complexity, all resources in Azure
-- **Geographic Redundancy**: Kafka clusters in different Azure regions (East US, West US 2)
-- **Neutral Gateway Location**: AKS cluster in Central US (independent from both Kafka clusters)
-- **Private DNS**: Azure Private DNS Zone created and managed via Terraform
-- **Automated DNS Updates**: A records automatically updated with LoadBalancer IP
-- **TLS Everywhere**: Encrypted connections from clients to gateway and gateway to clusters
-- **RBAC Security**: Cluster-specific service accounts with CloudClusterAdmin roles
+### Topics Configuration
+
+| Topic | Primary Cluster | DR Cluster | Purpose |
+|-------|----------------|------------|---------|
+| **test_topic** | ✅ Writable | ✅ Writable | Independent testing on both clusters |
+| **mirrored_topic** | ✅ Writable (source) | 📖 Read-only (mirror) | Demonstrates cluster linking & DR |
+
+### Cluster Linking
+
+- **Link Name**: `primary-to-dr-link`
+- **Direction**: Primary → DR
+- **Mode**: DESTINATION
+- **Connection**: OUTBOUND
+- **Status**: ACTIVE
+- **Replication**: Near real-time (< 1 second lag)
 
 ---
 
-## 📊 What Gets Created
+## ✅ Testing & Verification
 
-### Azure Infrastructure (Central US)
-
-| Resource | Name/Value | Purpose |
-|----------|------------|---------|
-| **Resource Group** | `cc-gateway-rg` | Container for all Azure resources |
-| **Virtual Network** | `cc-gateway-aks-vnet` | Network isolation (CIDR: 10.0.0.0/16) |
-| **Subnet** | `cc-gateway-aks-subnet` | AKS nodes subnet (10.0.1.0/24) |
-| **Network Security Group** | `cc-gateway-aks-nsg` | Firewall rules (HTTPS, Kafka ports) |
-| **AKS Cluster** | `cc-gateway-aks` | Kubernetes 1.36, 2 nodes (Standard_D2s_v3) |
-| **Azure Private DNS Zone** | `axa.com` | Private DNS for gateway domain |
-| **DNS A Record** | `kafka.cc.axa.com` | Points to LoadBalancer IP |
-| **VNet Link** | DNS to VNet | Enables DNS resolution in AKS |
-
-### Confluent Cloud Resources
-
-#### Primary Cluster (East US)
-- **Environment**: `cc-gateway-demo-azure`
-- **Cluster**: `azure-eastus-primary` (Basic tier)
-- **Cloud**: Azure
-- **Region**: eastus
-- **Availability**: Single Zone (configurable to Multi Zone)
-- **Service Account**: With CloudClusterAdmin role
-- **API Keys**: Cluster-specific keys with full permissions
-- **ACLs**: CREATE, WRITE, READ, DESCRIBE on topics
-
-#### DR Cluster (West US 2)
-- **Cluster**: `azure-westus2-dr` (Basic tier)
-- **Cloud**: Azure
-- **Region**: westus2
-- **Availability**: Single Zone (configurable to Multi Zone)
-- **Service Account**: With CloudClusterAdmin role
-- **API Keys**: Cluster-specific keys with full permissions
-- **ACLs**: CREATE, WRITE, READ, DESCRIBE on topics
-
-#### Schema Registry (Fully Automated)
-- **Package**: Advanced (with Governance features)
-- **Endpoint**: Public REST endpoint
-- **Region**: Automatically provisioned
-- **Service Account**: With ResourceOwner role
-- **API Keys**: Schema Registry-specific key
-- **Features**: Schema validation, compatibility checking, versioning
-- **Deployment**: Fully automated via Terraform (no manual steps!)
-
-### Kubernetes Resources (on AKS)
-
-| Resource | Type | Purpose |
-|----------|------|---------|
-| **Namespace** | `confluent` | Isolation for Confluent components |
-| **Confluent Operator** | Helm Release | Manages Confluent Gateway lifecycle |
-| **Gateway Deployment** | `confluent-gateway` | Routes traffic between clusters |
-| **LoadBalancer Service** | `confluent-gateway-bootstrap-lb` | External access with Azure LB |
-| **Kafka Tools Pod** | Testing pod | Producer/consumer testing |
-| **Secrets (6)** | TLS & Config | Certificates and client configurations |
-
----
-
-## ✅ Key Features
-
-1. ✅ **All on Azure** - No cross-cloud complexity
-2. ✅ **Geographic Redundancy** - Clusters in different Azure regions
-3. ✅ **Neutral Gateway Location** - AKS in third region (Central US)
-4. ✅ **Automated DNS** - Azure Private DNS Zone via Terraform
-5. ✅ **One-Command Deployment** - `./deploy.sh` does everything
-6. ✅ **One-Command Cleanup** - `./destroy.sh` removes all resources
-7. ✅ **Certificate Automation** - Makefile handles all certificates
-8. ✅ **Switchover Ready** - Switch clusters in minutes
-9. ✅ **Security First** - Private DNS, TLS everywhere, RBAC
-10. ✅ **Production Ready** - Multi-zone support, monitoring, ACLs
-
----
-
-## 📋 Prerequisites
-
-### Required Tools
-
-- [Terraform](https://www.terraform.io/downloads.html) >= 1.0
-- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) (`az login` configured)
-- [kubectl](https://kubernetes.io/docs/tasks/tools/) - Kubernetes CLI
-- [Helm](https://helm.sh/docs/intro/install/) >= 3.0
-- [OpenSSL](https://www.openssl.org/) - Certificate generation
-- Java KeyTool (part of JDK) - JKS truststore conversion
-
-### Required Accounts & Credentials
-
-- **Azure Subscription** with permissions to create:
-  - Resource Groups
-  - AKS Clusters
-  - VNets and NSGs
-  - Private DNS Zones
-- **Confluent Cloud Account** with:
-  - Cloud API Keys ([Get them here](https://confluent.cloud/settings/api-keys))
-  - OrganizationAdmin role (for ACL creation)
-
----
-
-## 🚀 Automated Deployment Guide
-
-### Step 1: Azure Setup
+### Verify Cluster Linking
 
 ```bash
-# Login to Azure
-az login
-
-# List subscriptions
-az account list --output table
-
-# Set active subscription
-az account set --subscription "YOUR_SUBSCRIPTION_ID"
-
-# Get subscription ID
-az account show --query id -o tsv
+./scripts/verify-cluster-linking.sh
 ```
 
-### Step 2: Configuration
+**This script:**
+1. Tests connectivity to both clusters
+2. Produces messages to Primary cluster
+3. Verifies replication to DR cluster
+4. Reports cluster linking status
+
+### Manual Testing
+
+#### Test 1: Write to test_topic (Both Clusters)
 
 ```bash
-# Copy environment template
-cp .env.example .env
-
-# Edit configuration
-nano .env
-```
-
-**Required configuration in `.env`:**
-```bash
-# Azure Configuration
-AZURE_SUBSCRIPTION_ID=your-azure-subscription-id
-OWNER_EMAIL=your.email@company.com
-AZURE_LOCATION=centralus
-
-# Confluent Cloud Configuration
-CONFLUENT_CLOUD_API_KEY=your-cloud-api-key
-CONFLUENT_CLOUD_API_SECRET=your-cloud-api-secret
-
-# DNS Configuration (optional, uses defaults)
-DNS_ZONE_NAME=axa.com
-GATEWAY_DNS_RECORD_NAME=kafka.cc
-GATEWAY_DOMAIN=kafka.cc.axa.com
-```
-
-### Step 3: Deploy
-
-```bash
-# Deploy everything (takes ~20 minutes)
-./deploy.sh
-```
-
-**What happens during deployment:**
-
-1. ✅ **Pre-flight Checks** - Validates tools and credentials
-2. ✅ **AKS Cluster** - Deploys Kubernetes cluster (10-15 min)
-3. ✅ **Confluent Operator** - Installs via Helm
-4. ✅ **Confluent Cloud Clusters** - Creates Primary + DR clusters (5-10 min)
-5. ✅ **Certificates** - Downloads and converts all certificates
-6. ✅ **Kubernetes Secrets** - Creates all required secrets
-7. ✅ **Gateway Deployment** - Deploys and configures gateway
-8. ✅ **DNS Configuration** - Creates A record with LoadBalancer IP
-9. ✅ **Kafka Tools Pod** - Deploys testing pod
-10. ✅ **Verification** - Displays summary and next steps
-
-### Step 4: Verify Deployment
-
-```bash
-# Check all pods are running
-kubectl get pods -n confluent
-
-# Check services
-kubectl get svc -n confluent
-
-# Verify DNS record
-az network private-dns record-set a show \
-  --resource-group cc-gateway-rg \
-  --zone-name axa.com \
-  --name kafka.cc
-```
-
-### Step 5: Test Connectivity
-
-#### Test Primary Cluster (East US)
-
-**Note:** The gateway must be configured to route to `cc-primary` first. Check with:
-```bash
-kubectl get gateway confluent-gateway -n confluent -o yaml | grep "bootstrapServerId:"
-```
-
-```bash
-# List topics on Primary cluster
-kubectl exec kafka-tools -n confluent -- kafka-topics \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --command-config /etc/kafka/client-primary/client-primary.properties \
-  --list
-
-# Create test topic on Primary (if not exists)
-kubectl exec kafka-tools -n confluent -- kafka-topics \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --command-config /etc/kafka/client-primary/client-primary.properties \
-  --create --topic test_topic --partitions 3 --replication-factor 3
-
-# Produce test messages to Primary
+# Primary cluster
 kubectl exec kafka-tools -n confluent -- bash -c \
-  'echo -e "primary-msg-1\nprimary-msg-2\nprimary-msg-3" | kafka-console-producer \
+  'echo -e "primary-1\nprimary-2" | kafka-console-producer \
     --bootstrap-server kafka.cc.axa.com:9092 \
     --producer.config /etc/kafka/client-primary/client-primary.properties \
     --topic test_topic'
 
-# Consume messages from Primary
-kubectl exec kafka-tools -n confluent -- kafka-console-consumer \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --consumer.config /etc/kafka/client-primary/client-primary.properties \
-  --topic test_topic \
-  --from-beginning \
-  --max-messages 10 \
-  --timeout-ms 10000
-```
-
-#### Test DR Cluster (West US 2)
-
-**Note:** The gateway must be configured to route to `cc-dr` first. Switch using the instructions in [Cluster Switchover Process](#-cluster-switchover-process).
-
-```bash
-# List topics on DR cluster
-kubectl exec kafka-tools -n confluent -- kafka-topics \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --command-config /etc/kafka/client-dr/client-dr.properties \
-  --list
-
-# Create test topic on DR (if not exists)
-kubectl exec kafka-tools -n confluent -- kafka-topics \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --command-config /etc/kafka/client-dr/client-dr.properties \
-  --create --topic test_topic --partitions 3 --replication-factor 3
-
-# Produce test messages to DR
+# DR cluster
 kubectl exec kafka-tools -n confluent -- bash -c \
-  'echo -e "dr-msg-1\ndr-msg-2\ndr-msg-3" | kafka-console-producer \
+  'echo -e "dr-1\ndr-2" | kafka-console-producer \
     --bootstrap-server kafka.cc.axa.com:9092 \
     --producer.config /etc/kafka/client-dr/client-dr.properties \
     --topic test_topic'
+```
 
-# Consume messages from DR
+#### Test 2: Cluster Linking Replication
+
+```bash
+# Produce to mirrored_topic on Primary
+kubectl exec kafka-tools -n confluent -- bash -c \
+  'echo -e "replicated-1\nreplicated-2\nreplicated-3" | kafka-console-producer \
+    --bootstrap-server kafka.cc.axa.com:9092 \
+    --producer.config /etc/kafka/client-primary/client-primary.properties \
+    --topic mirrored_topic'
+
+# Wait for replication (typically < 1 second)
+sleep 2
+
+# Consume from DR cluster (should see replicated messages)
 kubectl exec kafka-tools -n confluent -- kafka-console-consumer \
   --bootstrap-server kafka.cc.axa.com:9092 \
   --consumer.config /etc/kafka/client-dr/client-dr.properties \
-  --topic test_topic \
+  --topic mirrored_topic \
   --from-beginning \
-  --max-messages 10 \
+  --max-messages 3 \
   --timeout-ms 10000
 ```
 
-**✅ Both clusters are accessible through the same gateway endpoint (`kafka.cc.axa.com:9092`)!**  
-**⚠️ Important:** The gateway routes to ONE cluster at a time. Use the correct client config that matches the active cluster.
+#### Test 3: Mirror Topic is Read-Only on DR
+
+```bash
+# This should FAIL (mirror topics are read-only)
+kubectl exec kafka-tools -n confluent -- bash -c \
+  'echo "test" | kafka-console-producer \
+    --bootstrap-server kafka.cc.axa.com:9092 \
+    --producer.config /etc/kafka/client-dr/client-dr.properties \
+    --topic mirrored_topic'
+
+# Expected error: "Cannot append records to read-only mirror topic"
+```
+
+### Check Resources
+
+```bash
+# All Kubernetes resources
+kubectl get all -n confluent
+
+# Gateway status
+kubectl get gateway confluent-gateway -n confluent -o yaml
+
+# Gateway logs
+kubectl logs -n confluent -l app=confluent-gateway --tail=50
+
+# Active cluster routing
+kubectl get gateway confluent-gateway -n confluent -o yaml | grep "bootstrapServerId:"
+```
 
 ---
 
-## 🔄 Cluster Switchover Process
+## 🔄 DR Failover
 
-To switch from **Primary** (East US) to **DR** (West US 2):
+Disaster recovery failover involves promoting the read-only mirror topic to a writable regular topic on the DR cluster and switching applications to use the DR cluster.
 
-### Step 1: Edit Gateway Configuration
+### Understanding Failover
+
+**Before Failover:**
+```
+Primary (Standard)          DR (Dedicated)
+  mirrored_topic     ─────>  mirrored_topic
+  (writable source)   CL     (read-only mirror)
+                             ❌ Cannot write
+```
+
+**After Failover:**
+```
+Primary (Standard)          DR (Dedicated)
+  mirrored_topic             mirrored_topic
+  (writable)                 (writable - promoted)
+                             ✅ Can write
+                             ⚠️  Replication stopped
+```
+
+### When to Failover
+
+Failover to DR cluster when:
+- ❌ Primary cluster is unavailable (disaster)
+- ❌ Primary region has outage
+- 🔧 Planned maintenance on Primary cluster
+- 🧪 DR testing exercises
+
+---
+
+### Option 1: Automated Failover (Recommended)
+
+#### Script: `scripts/failover-mirrored-topic.sh`
+
+**Prerequisites:**
+- [Confluent CLI](https://docs.confluent.io/confluent-cli/current/install.html) installed
+- Terraform applied successfully
+- Mirror topic `mirrored_topic` exists and is active
+
+**Installation (Confluent CLI):**
+```bash
+# macOS
+brew install confluentinc/tap/cli
+
+# Linux
+curl -sL --http1.1 https://cnfl.io/cli | sh -s -- latest
+
+# Windows
+# Download from: https://docs.confluent.io/confluent-cli/current/install.html
+```
+
+#### Run the Failover Script
+
+```bash
+./scripts/failover-mirrored-topic.sh
+```
+
+#### What the Script Does
+
+**Step 1: Pre-Failover Verification**
+- ✅ Checks Confluent CLI is installed
+- ✅ Extracts cluster IDs and API keys from Terraform
+- ✅ Verifies mirror topic exists and is active
+- ✅ Shows current cluster link status
+
+**Step 2: Dry-Run Preview**
+```bash
+# Script runs this automatically:
+confluent kafka mirror failover mirrored_topic \
+  --link primary-to-dr-link \
+  --cluster <DR-cluster-id> \
+  --dry-run
+```
+- Shows what will happen without making changes
+- Lists topics that will be promoted
+- Displays cluster link impact
+
+**Step 3: Confirmation Prompt**
+```
+⚠ This will PROMOTE the mirror topic to a regular writable topic on DR cluster
+After promotion:
+  • The topic will be WRITABLE on DR cluster
+  • The cluster link for this topic will be STOPPED
+  • This operation is IRREVERSIBLE
+
+Do you want to proceed with failover? (type 'yes' to confirm):
+```
+- Type **`yes`** to proceed
+- Any other input cancels the operation
+
+**Step 4: Execute Failover**
+```bash
+# Script executes:
+confluent kafka mirror failover mirrored_topic \
+  --link primary-to-dr-link \
+  --cluster <DR-cluster-id>
+```
+- Promotes mirror topic to regular topic
+- Stops replication from Primary cluster
+- Topic becomes writable on DR cluster
+
+**Step 5: Post-Failover Testing**
+```bash
+# Script automatically:
+# 1. Configures CLI for DR cluster
+confluent api-key use <DR-api-key> --resource <DR-cluster-id>
+
+# 2. Produces test messages
+echo "failover-msg-1" | confluent kafka topic produce mirrored_topic
+
+# 3. Consumes messages to verify
+confluent kafka topic consume mirrored_topic --from-beginning
+```
+
+**Step 6: Kubernetes Testing**
+- Tests write via kafka-tools pod
+- Verifies gateway can access the promoted topic
+- Confirms end-to-end functionality
+
+#### Expected Output
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Step 1: Pre-Failover Verification
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Confluent CLI is installed
+✓ Configuration loaded
+
+  DR Cluster ID: lkc-6kkg2xj
+  Cluster Link: primary-to-dr-link
+  Mirror Topic: mirrored_topic
+
+✓ Mirror topic found: mirrored_topic
+  Link Name: primary-to-dr-link
+  State: ACTIVE
+  Lag: 0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Step 2: Preview Failover (Dry-Run)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mirror Topics that will be promoted:
+  - mirrored_topic (from link: primary-to-dr-link)
+
+✓ Dry-run completed
+
+⚠ This will PROMOTE the mirror topic to a regular writable topic
+...
+Do you want to proceed? (type 'yes' to confirm): yes
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Step 3: Execute Failover
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Failover completed successfully!
+✓ Topic 'mirrored_topic' is now a WRITABLE regular topic on DR cluster
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Step 4: Post-Failover Verification
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ API key configured for DR cluster
+✓ Successfully produced 5 test messages to promoted topic!
+✓ Messages successfully consumed from promoted topic on DR cluster
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Failover Summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Failover Complete!
+
+Topic Status:
+  Topic: mirrored_topic
+  Cluster: lkc-6kkg2xj (DR - Dedicated)
+  Status: ✅ WRITABLE (promoted from mirror)
+  Cluster Link: ⚠️  STOPPED for this topic
+```
+
+---
+
+### Option 2: Manual Failover (Step-by-Step)
+
+For full control over each step:
+
+#### Step 1: Get Cluster Information
+
+```bash
+cd terraform/confluent-cloud
+
+# Extract values
+DR_CLUSTER_ID=$(terraform output -raw dr_cluster_id)
+DR_API_KEY=$(terraform output -raw dr_cluster_api_key)
+DR_API_SECRET=$(terraform output -raw dr_cluster_api_secret)
+LINK_NAME=$(terraform output -raw cluster_link_name)
+
+# Display values
+echo "DR Cluster: $DR_CLUSTER_ID"
+echo "Link Name: $LINK_NAME"
+```
+
+#### Step 2: Verify Current State
+
+```bash
+# Check mirror topic status
+confluent kafka mirror list \
+  --link $LINK_NAME \
+  --cluster $DR_CLUSTER_ID
+
+# Check cluster link health
+confluent kafka link describe $LINK_NAME \
+  --cluster $DR_CLUSTER_ID
+```
+
+Expected output:
+```
+Mirror Topic Name    State    Source Topic       Lag
+mirrored_topic       ACTIVE   mirrored_topic     0
+```
+
+#### Step 3: Preview Failover (Dry-Run)
+
+```bash
+confluent kafka mirror failover mirrored_topic \
+  --link $LINK_NAME \
+  --cluster $DR_CLUSTER_ID \
+  --dry-run
+```
+
+This shows what will happen **without making changes**.
+
+#### Step 4: Execute Failover
+
+```bash
+confluent kafka mirror failover mirrored_topic \
+  --link $LINK_NAME \
+  --cluster $DR_CLUSTER_ID
+```
+
+**⚠️ WARNING**: This operation is **irreversible**. The mirror topic will be promoted to a regular topic and replication will stop.
+
+Confirmation prompt:
+```
+Are you sure you want to failover mirror topic 'mirrored_topic'? (y/n):
+```
+Type **`y`** to proceed.
+
+#### Step 5: Configure CLI for DR Cluster
+
+```bash
+confluent api-key use $DR_API_KEY --resource $DR_CLUSTER_ID
+```
+
+#### Step 6: Test Write to Promoted Topic
+
+```bash
+# Produce test messages
+echo -e "failover-test-1\nfailover-test-2\nfailover-test-3" | \
+  confluent kafka topic produce mirrored_topic \
+  --cluster $DR_CLUSTER_ID
+```
+
+Expected output:
+```
+Produced message to partition 0 at offset 0.
+Produced message to partition 1 at offset 0.
+Produced message to partition 2 at offset 0.
+```
+
+✅ **Success!** Topic is now writable.
+
+#### Step 7: Verify Messages
+
+```bash
+confluent kafka topic consume mirrored_topic \
+  --cluster $DR_CLUSTER_ID \
+  --from-beginning \
+  --max-messages 3
+```
+
+You should see the messages you just produced.
+
+---
+
+### Post-Failover: Switch Gateway to DR Cluster
+
+After promoting the mirror topic, update the gateway to route traffic to the DR cluster.
+
+#### Edit Gateway Configuration
 
 ```bash
 nano kubernetes-resources/gateway.yaml
 ```
 
-Change lines 50-52:
-```yaml
-# FROM:
-streamingDomain:
-  name: cc-primary
-  bootstrapServerId: CC_PRIMARY
+**Change lines 50-52:**
 
-# TO:
-streamingDomain:
-  name: cc-dr
-  bootstrapServerId: CC_DR
+```yaml
+# BEFORE (routing to Primary):
+routes:
+  - name: primary-route
+    endpoint: "kafka.cc.axa.com:9092"
+    streamingDomain:
+      name: cc-primary
+      bootstrapServerId: CC_PRIMARY
+
+# AFTER (routing to DR):
+routes:
+  - name: dr-route
+    endpoint: "kafka.cc.axa.com:9092"
+    streamingDomain:
+      name: cc-dr
+      bootstrapServerId: CC_DR
 ```
 
-### Step 2: Apply Changes
+#### Apply Gateway Changes
 
 ```bash
-# Apply the updated configuration
+# Apply updated configuration
 kubectl apply -f kubernetes-resources/gateway.yaml -n confluent
 
-# Restart gateway pods
+# Restart gateway pods to pick up changes
 kubectl delete pod -n confluent -l app=confluent-gateway
 
 # Wait for gateway to be ready
-kubectl wait --for=condition=Ready pod -l app=confluent-gateway --timeout=120s -n confluent
+kubectl wait --for=condition=Ready pod \
+  -l app=confluent-gateway \
+  -n confluent \
+  --timeout=120s
 ```
 
-### Step 3: Verify Switchover
+#### Verify Gateway Switchover
 
 ```bash
-# Check which cluster is active
-kubectl get gateway confluent-gateway -n confluent -o yaml | grep -A5 "streamingDomain:"
+# Check which cluster the gateway is routing to
+kubectl get gateway confluent-gateway -n confluent -o yaml | grep "bootstrapServerId:"
 
-# Test with DR credentials
+# Expected output:
+# bootstrapServerId: CC_DR
+
+# Test via gateway
 kubectl exec kafka-tools -n confluent -- kafka-topics \
   --bootstrap-server kafka.cc.axa.com:9092 \
   --command-config /etc/kafka/client-dr/client-dr.properties \
   --list
-
-# Produce messages to DR cluster
-kubectl exec kafka-tools -n confluent -- bash -c \
-  'echo -e "dr-test-1\ndr-test-2\ndr-test-3" | kafka-console-producer \
-    --bootstrap-server kafka.cc.axa.com:9092 \
-    --producer.config /etc/kafka/client-dr/client-dr.properties \
-    --topic test_topic_dr'
-
-# Consume messages from DR cluster
-kubectl exec kafka-tools -n confluent -- kafka-console-consumer \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --consumer.config /etc/kafka/client-dr/client-dr.properties \
-  --topic test_topic_dr \
-  --from-beginning \
-  --max-messages 10 \
-  --timeout-ms 10000
 ```
-
-**✅ Switchover complete!** Clients reconnect automatically to the new cluster through the same endpoint: `kafka.cc.axa.com:9092`
 
 ---
 
-## 🔍 Verification & Monitoring
+### Complete DR Failover Checklist
+
+Use this checklist for a complete DR failover:
+
+- [ ] **Verify DR cluster is healthy**
+  ```bash
+  ./scripts/verify-cluster-linking.sh
+  ```
+
+- [ ] **Stop writes to Primary cluster** (application-level)
+
+- [ ] **Wait for replication to catch up**
+  ```bash
+  confluent kafka mirror list --link primary-to-dr-link --cluster <DR-cluster-id>
+  # Ensure lag is 0
+  ```
+
+- [ ] **Promote mirror topic**
+  ```bash
+  ./scripts/failover-mirrored-topic.sh
+  # Type 'yes' when prompted
+  ```
+
+- [ ] **Switch gateway to DR cluster**
+  ```bash
+  # Edit kubernetes-resources/gateway.yaml
+  # Change cc-primary to cc-dr
+  kubectl apply -f kubernetes-resources/gateway.yaml -n confluent
+  kubectl delete pod -n confluent -l app=confluent-gateway
+  ```
+
+- [ ] **Update application configurations**
+  - Point applications to DR cluster bootstrap endpoint
+  - Update connection strings, configs, etc.
+
+- [ ] **Verify writes to DR cluster work**
+  ```bash
+  kubectl exec kafka-tools -n confluent -- bash -c \
+    'echo "dr-test" | kafka-console-producer \
+      --bootstrap-server kafka.cc.axa.com:9092 \
+      --producer.config /etc/kafka/client-dr/client-dr.properties \
+      --topic mirrored_topic'
+  ```
+
+- [ ] **Monitor DR cluster**
+  - Check Confluent Cloud UI for cluster health
+  - Monitor consumer lag
+  - Verify all topics are accessible
+
+- [ ] **Document failover**
+  - Record time of failover
+  - Note any issues encountered
+  - Update runbooks
+
+---
+
+### Failback to Primary (Restore Original Setup)
+
+After the Primary cluster issue is resolved, you may want to failback.
+
+#### Option 1: Recreate Cluster Link (Clean Start)
 
 ```bash
-# Check all Kubernetes resources
-kubectl get all -n confluent
+cd terraform/confluent-cloud
 
-# Check gateway status and active cluster
-kubectl get gateway confluent-gateway -n confluent -o yaml | grep -A5 "streamingDomain:"
+# Re-apply Terraform to recreate cluster link and mirror topic
+# Note: This will create a NEW mirror topic, starting replication fresh
+terraform apply
 
-# View gateway logs
-kubectl logs -n confluent -l app=confluent-gateway --tail=100 -f
+# Wait for replication to catch up
+# Monitor via Confluent Cloud UI or CLI
+```
 
-# Check Azure DNS record
-az network private-dns record-set a show \
-  --resource-group cc-gateway-rg \
-  --zone-name axa.com \
-  --name kafka.cc
+#### Option 2: Create Reverse Link (DR → Primary)
+
+Requires creating a new cluster link configuration in Terraform from DR to Primary, then using that to fail back.
+
+---
+
+### Troubleshooting Failover
+
+#### Issue: "Confluent CLI not found"
+
+```bash
+# Install Confluent CLI
+brew install confluentinc/tap/cli  # macOS
+
+# Or download from
+curl -sL --http1.1 https://cnfl.io/cli | sh -s -- latest
+```
+
+#### Issue: "Mirror topic not found"
+
+```bash
+# Check if mirror topic exists
+confluent kafka mirror list \
+  --link primary-to-dr-link \
+  --cluster <DR-cluster-id>
+
+# If missing, verify cluster linking is active
+terraform output cluster_link_status
+```
+
+#### Issue: "Failover failed - topic has lag"
+
+```bash
+# Wait for replication to catch up
+confluent kafka mirror list --link primary-to-dr-link --cluster <DR-cluster-id>
+
+# Once lag is 0, retry failover
+```
+
+#### Issue: Cannot write after failover
+
+```bash
+# Verify topic was promoted
+confluent kafka topic describe mirrored_topic --cluster <DR-cluster-id>
+
+# Check API key permissions
+confluent api-key list
+
+# Ensure using correct API key for DR cluster
+confluent api-key use <DR-api-key> --resource <DR-cluster-id>
 ```
 
 ---
 
 ## 🧹 Cleanup
 
+### Automated Cleanup
+
 ```bash
 ./destroy.sh
 ```
 
 **This removes:**
-- ✅ Confluent Cloud clusters (Primary + DR)
-- ✅ Schema Registry
-- ✅ AKS cluster and all Kubernetes resources
-- ✅ VNet, NSG, and all network resources
-- ✅ Azure Private DNS Zone
-- ✅ Resource Group (if empty)
-- ✅ All local certificates and temporary files
+- Kubernetes resources (Gateway, Operator, Pods, Secrets)
+- Confluent Cloud clusters (Primary + DR)
+- Cluster linking and mirror topics
+- Schema Registry
+- AKS cluster and networking
+- Azure DNS zone
+- All certificates and temporary files
+
+### Manual Cleanup
+
+```bash
+# Step 1: Delete Kubernetes resources
+kubectl delete -f kubernetes-resources/gateway.yaml -n confluent
+kubectl delete -f kubernetes-resources/kafka-tools.yaml -n confluent
+kubectl delete secrets -n confluent --all
+helm uninstall confluent-operator -n confluent
+kubectl delete namespace confluent
+
+# Step 2: Destroy Confluent Cloud resources
+cd terraform/confluent-cloud
+terraform destroy
+
+# Step 3: Destroy AKS cluster
+cd ../aks
+terraform destroy
+
+# Step 4: Clean up certificates
+cd ../..
+make clean-certs
+```
 
 ---
 
-## 🔐 Security Best Practices
+## 📊 Cost Estimate
 
-1. **Private DNS Only** - DNS zone is private, not exposed to internet
-2. **TLS Encryption** - All connections encrypted (client→gateway, gateway→cluster)
-3. **Network Security Groups** - Firewall rules limit access
-4. **Cluster-Specific API Keys** - Separate credentials for each cluster
-5. **RBAC** - Service accounts with CloudClusterAdmin role
-6. **Managed Identity** - AKS uses system-assigned managed identity
-7. **Secret Management** - Kubernetes secrets for sensitive data
-8. **No Hardcoded Credentials** - All credentials in .env (gitignored)
+| Component | Monthly Cost |
+|-----------|--------------|
+| Primary Cluster (Standard) | ~$50-100 |
+| DR Cluster (Dedicated, 1 CKU) | ~$500 |
+| Schema Registry (Advanced) | Included |
+| Cluster Linking | No additional cost |
+| **Total Confluent Cloud** | **~$550-600** |
+| AKS (2 nodes, D2s_v3) | ~$140 |
+| Azure LoadBalancer | ~$20 |
+| VNet & DNS | ~$5 |
+| **Total Azure** | **~$165** |
+| **GRAND TOTAL** | **~$715-765/month** |
 
 ---
 
-## 📚 File Structure
+## 📁 Repository Structure
 
 ```
 .
-├── README.md                        # Complete documentation
+├── README.md                        # This file
 ├── .env.example                     # Configuration template
 ├── deploy.sh                        # Automated deployment
 ├── destroy.sh                       # Automated cleanup
 ├── Makefile                         # Certificate automation
+├── scripts/
+│   ├── verify-cluster-linking.sh    # Verify cluster linking
+│   └── failover-mirrored-topic.sh   # DR failover automation
 ├── terraform/
 │   ├── aks/                         # Azure AKS infrastructure
-│   └── confluent-cloud/             # Confluent Cloud clusters & Schema Registry
-├── certs/                           # Downloaded certificates
-├── gateway-tls-cert/                # Generated gateway certificates
-├── clients/                         # Client configuration files
-└── kubernetes-resources/
-    ├── gateway.yaml                 # Gateway configuration
-    └── kafka-tools.yaml             # Testing pod
+│   └── confluent-cloud/             # Confluent Cloud resources
+├── kubernetes-resources/
+│   ├── gateway.yaml                 # Gateway configuration
+│   └── kafka-tools.yaml             # Testing pod
+├── certs/                           # Generated certificates
+├── gateway-tls-cert/                # Gateway TLS certificates
+└── clients/                         # Client configuration files
 ```
 
 ---
 
-## 🚀 Production Deployment Considerations
+## 🔗 Useful Links
 
-1. **Multi-Zone Availability**: Change `KAFKA_AVAILABILITY=MULTI_ZONE` in .env
-2. **Certificate Authority**: Use trusted CA instead of self-signed certificates
-3. **DNS TTL**: Use low TTL (60s) for faster failover
-4. **Monitoring**: Set up Azure Monitor and Confluent Cloud metrics
-5. **Backup Strategy**: Regular backups of gateway configuration
-6. **Testing**: Regular switchover testing (monthly recommended)
-7. **Client Configuration**: Proper retry logic and timeouts
-8. **Resource Sizing**: Scale AKS nodes based on traffic
-9. **Cost Optimization**: Use Azure Reservations for long-term savings
+- [Confluent Cloud Console](https://confluent.cloud)
+- [Confluent CLI Installation](https://docs.confluent.io/confluent-cli/current/install.html)
+- [Cluster Linking Documentation](https://docs.confluent.io/cloud/current/multi-cloud/cluster-linking/index.html)
+- [DR Failover Guide](https://docs.confluent.io/cloud/current/multi-cloud/cluster-linking/disaster-recovery.html)
+- [Standard vs Dedicated Clusters](https://docs.confluent.io/cloud/current/clusters/cluster-types.html)
 
 ---
 
-## 📊 Quick Command Reference
+## 🆘 Troubleshooting
+
+### Issue: LoadBalancer IP not assigned
 
 ```bash
-# Deployment & Cleanup
-./deploy.sh                          # Deploy everything
-./destroy.sh                         # Destroy everything
+# Check service
+kubectl get svc confluent-gateway-bootstrap-lb -n confluent
 
-# Certificate Management
-make certs k8s-secrets               # Create all certificates and secrets
-make verify-certs                    # Verify certificates
-make help                            # Show all Makefile commands
+# Check events
+kubectl describe svc confluent-gateway-bootstrap-lb -n confluent
 
-# Monitoring
-kubectl get all -n confluent         # Check all resources
-kubectl logs -n confluent -l app=confluent-gateway  # Gateway logs
-kubectl get gateway confluent-gateway -n confluent -o yaml | grep "bootstrapServerId:"  # Active cluster
+# Wait longer (can take up to 5 minutes)
+```
 
-# Testing
-kubectl exec kafka-tools -n confluent -- kafka-topics \
-  --bootstrap-server kafka.cc.axa.com:9092 \
-  --command-config /etc/kafka/client-primary/client-primary.properties \
-  --list
+### Issue: Gateway pod not ready
+
+```bash
+# Check pod status
+kubectl get pods -n confluent -l app=confluent-gateway
+
+# View logs
+kubectl logs -n confluent -l app=confluent-gateway --tail=100
+
+# Check for secret issues
+kubectl get secrets -n confluent
+```
+
+### Issue: Cluster linking not working
+
+```bash
+# Run verification script
+./scripts/verify-cluster-linking.sh
+
+# Check link status via Terraform
+cd terraform/confluent-cloud
+terraform output cluster_link_status
+
+# Check via Confluent Cloud UI
+# Go to: https://confluent.cloud/environments
+# Select environment → DR cluster → Cluster Linking
+```
+
+### Issue: Cannot write to mirrored_topic on DR
+
+**This is expected!** Mirror topics are read-only. Use the failover script to promote:
+
+```bash
+./scripts/failover-mirrored-topic.sh
 ```
 
 ---
 
-## 🎯 Summary
+**🎉 You're ready to deploy Confluent Cloud Gateway with cluster linking on Azure!**
 
-This repository provides a **complete, production-ready** Confluent Cloud Gateway deployment on Azure:
-
-✅ **Fully Automated** - One command to deploy, one to destroy  
-✅ **Multi-Region** - Geographic redundancy across 3 Azure regions  
-✅ **Secure** - Private DNS, TLS everywhere, RBAC, Network Security Groups  
-✅ **Cost-Effective** - ~$2,925/month for complete HA setup with Schema Registry  
-✅ **Production-Ready** - ACLs, Schema Registry, monitoring, multi-zone support  
-✅ **Easy Switchover** - Minutes to switch between clusters  
-✅ **Well Documented** - Comprehensive guides and troubleshooting  
-
-**Gateway Endpoint**: `kafka.cc.axa.com:9092`  
-**Schema Registry**: Public REST endpoint with Advanced governance
-
-**Resources**:
-- Primary Kafka: Azure East US (eastus)
-- DR Kafka: Azure West US 2 (westus2)
-- Schema Registry: Advanced package with public endpoint
-- Gateway (AKS): Azure Central US (centralus)
-
----
-
-## 💬 Support & Contributing
-
-- **Issues**: Open an issue on GitHub
-- **Questions**: See troubleshooting sections above
-- **Contributions**: PRs welcome!
-
----
-
-**🎉 Happy Confluent Gateway testing on Azure!**
+Choose your path:
+- **Quick Start**: Run `./deploy.sh` and go
+- **Manual**: Follow the step-by-step guide above

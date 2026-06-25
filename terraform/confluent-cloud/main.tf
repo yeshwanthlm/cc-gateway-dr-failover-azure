@@ -31,14 +31,14 @@ resource "confluent_environment" "main" {
   }
 }
 
-# Primary Azure Cluster in East US
+# Primary Azure Cluster in East US - Standard type
 resource "confluent_kafka_cluster" "primary_cluster" {
   display_name = var.primary_cluster_name
   availability = var.availability
   cloud        = "AZURE"
   region       = var.primary_cluster_region
 
-  basic {}
+  standard {}
 
   environment {
     id = confluent_environment.main.id
@@ -86,14 +86,16 @@ resource "confluent_api_key" "primary_cluster_api_key" {
   }
 }
 
-# DR Azure Cluster in West US 2
+# DR Azure Cluster in West US 2 - Dedicated type
 resource "confluent_kafka_cluster" "dr_cluster" {
   display_name = var.dr_cluster_name
   availability = var.availability
   cloud        = "AZURE"
   region       = var.dr_cluster_region
 
-  basic {}
+  dedicated {
+    cku = 1
+  }
 
   environment {
     id = confluent_environment.main.id
@@ -229,6 +231,215 @@ resource "confluent_api_key" "schema_registry_api_key" {
   depends_on = [
     confluent_role_binding.schema_registry_resource_owner,
     data.confluent_schema_registry_cluster.main
+  ]
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# =============================================================================
+# Topic Creation
+# =============================================================================
+
+# test_topic on Primary Cluster
+resource "confluent_kafka_topic" "test_topic_primary" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.primary_cluster.id
+  }
+
+  topic_name         = "test_topic"
+  partitions_count   = 3
+  rest_endpoint      = confluent_kafka_cluster.primary_cluster.rest_endpoint
+  config = {
+    "cleanup.policy"    = "delete"
+    "retention.ms"      = "604800000"  # 7 days
+    "segment.ms"        = "86400000"   # 1 day
+  }
+
+  credentials {
+    key    = confluent_api_key.primary_cluster_api_key.id
+    secret = confluent_api_key.primary_cluster_api_key.secret
+  }
+
+  depends_on = [
+    confluent_api_key.primary_cluster_api_key
+  ]
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# test_topic on DR Cluster (regular topic, NOT a mirror)
+# This allows direct writes to DR cluster for testing and failover scenarios
+resource "confluent_kafka_topic" "test_topic_dr" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.dr_cluster.id
+  }
+
+  topic_name         = "test_topic"
+  partitions_count   = 3
+  rest_endpoint      = confluent_kafka_cluster.dr_cluster.rest_endpoint
+  config = {
+    "cleanup.policy"    = "delete"
+    "retention.ms"      = "604800000"  # 7 days
+    "segment.ms"        = "86400000"   # 1 day
+  }
+
+  credentials {
+    key    = confluent_api_key.dr_cluster_api_key.id
+    secret = confluent_api_key.dr_cluster_api_key.secret
+  }
+
+  depends_on = [
+    confluent_api_key.dr_cluster_api_key
+  ]
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# =============================================================================
+# Cluster Linking Configuration
+# =============================================================================
+# Cluster Link from Primary (Standard) to DR (Dedicated) cluster
+# This enables disaster recovery and data replication
+
+# Service Account for Cluster Link on DR side
+resource "confluent_service_account" "cluster_link_dr" {
+  display_name = "cluster-link-dr-sa"
+  description  = "Service account for cluster link on DR cluster"
+}
+
+# Grant CloudClusterAdmin role to cluster link service account on DR cluster
+resource "confluent_role_binding" "cluster_link_dr_admin" {
+  principal   = "User:${confluent_service_account.cluster_link_dr.id}"
+  role_name   = "CloudClusterAdmin"
+  crn_pattern = confluent_kafka_cluster.dr_cluster.rbac_crn
+}
+
+# API Key for Cluster Link on DR Cluster
+resource "confluent_api_key" "cluster_link_dr_api_key" {
+  display_name = "cluster-link-dr-api-key"
+  description  = "API Key for cluster link on DR cluster"
+
+  owner {
+    id          = confluent_service_account.cluster_link_dr.id
+    api_version = confluent_service_account.cluster_link_dr.api_version
+    kind        = confluent_service_account.cluster_link_dr.kind
+  }
+
+  managed_resource {
+    id          = confluent_kafka_cluster.dr_cluster.id
+    api_version = confluent_kafka_cluster.dr_cluster.api_version
+    kind        = confluent_kafka_cluster.dr_cluster.kind
+
+    environment {
+      id = confluent_environment.main.id
+    }
+  }
+
+  depends_on = [
+    confluent_role_binding.cluster_link_dr_admin
+  ]
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# Cluster Link: Primary -> DR
+resource "confluent_cluster_link" "primary_to_dr" {
+  link_name = "primary-to-dr-link"
+  link_mode = "DESTINATION"
+
+  connection_mode = "OUTBOUND"
+
+  source_kafka_cluster {
+    id                 = confluent_kafka_cluster.primary_cluster.id
+    bootstrap_endpoint = confluent_kafka_cluster.primary_cluster.bootstrap_endpoint
+    credentials {
+      key    = confluent_api_key.primary_cluster_api_key.id
+      secret = confluent_api_key.primary_cluster_api_key.secret
+    }
+  }
+
+  destination_kafka_cluster {
+    id            = confluent_kafka_cluster.dr_cluster.id
+    rest_endpoint = confluent_kafka_cluster.dr_cluster.rest_endpoint
+    credentials {
+      key    = confluent_api_key.cluster_link_dr_api_key.id
+      secret = confluent_api_key.cluster_link_dr_api_key.secret
+    }
+  }
+
+  depends_on = [
+    confluent_kafka_topic.test_topic_primary,
+    confluent_api_key.primary_cluster_api_key,
+    confluent_api_key.cluster_link_dr_api_key
+  ]
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# mirrored_topic on Primary Cluster (source for mirroring)
+# This topic will be replicated to DR cluster via cluster linking
+resource "confluent_kafka_topic" "mirrored_topic_primary" {
+  kafka_cluster {
+    id = confluent_kafka_cluster.primary_cluster.id
+  }
+
+  topic_name         = "mirrored_topic"
+  partitions_count   = 3
+  rest_endpoint      = confluent_kafka_cluster.primary_cluster.rest_endpoint
+  config = {
+    "cleanup.policy"    = "delete"
+    "retention.ms"      = "604800000"  # 7 days
+    "segment.ms"        = "86400000"   # 1 day
+  }
+
+  credentials {
+    key    = confluent_api_key.primary_cluster_api_key.id
+    secret = confluent_api_key.primary_cluster_api_key.secret
+  }
+
+  depends_on = [
+    confluent_api_key.primary_cluster_api_key
+  ]
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# Mirror Topic: mirrored_topic from Primary to DR
+# This demonstrates cluster linking with automatic replication
+# Note: Mirror topics are read-only on the destination cluster
+resource "confluent_kafka_mirror_topic" "mirrored_topic_mirror" {
+  source_kafka_topic {
+    topic_name = "mirrored_topic"
+  }
+
+  cluster_link {
+    link_name = confluent_cluster_link.primary_to_dr.link_name
+  }
+
+  kafka_cluster {
+    id            = confluent_kafka_cluster.dr_cluster.id
+    rest_endpoint = confluent_kafka_cluster.dr_cluster.rest_endpoint
+    credentials {
+      key    = confluent_api_key.cluster_link_dr_api_key.id
+      secret = confluent_api_key.cluster_link_dr_api_key.secret
+    }
+  }
+
+  depends_on = [
+    confluent_cluster_link.primary_to_dr,
+    confluent_kafka_topic.mirrored_topic_primary
   ]
 
   lifecycle {

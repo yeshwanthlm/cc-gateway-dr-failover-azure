@@ -22,7 +22,7 @@ spec:
         name: cc-primary-cluster
         bootstrapServers:
           - id: CC_PRIMARY
-            endpoint: pkc-xxxxxx.eastus.azure.confluent.cloud:9092
+            endpoint: pkc-56d1g.eastus.azure.confluent.cloud:9092
             tls:
               secretRef: cc-primary-tls
         nodeIdRanges:
@@ -35,7 +35,7 @@ spec:
         name: cc-dr-cluster
         bootstrapServers:
           - id: CC_DR
-            endpoint: pkc-yyyyyy.westus2.azure.confluent.cloud:9092
+            endpoint: pkc-wjpz65.westus2.azure.confluent.cloud:9092
             tls:
               secretRef: cc-dr-tls
         nodeIdRanges:
@@ -48,8 +48,8 @@ spec:
       brokerIdentificationStrategy:
         type: port
       streamingDomain:
-        name: cc-dr
-        bootstrapServerId: CC_DR
+        name: cc-primary
+        bootstrapServerId: CC_PRIMARY
       security:
         auth: passthrough
         client:

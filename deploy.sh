@@ -5,7 +5,11 @@
 # =============================================================================
 # This script automates the complete deployment of:
 # - Azure AKS Cluster
-# - Confluent Cloud Kafka Clusters (Azure Primary & DR)
+# - Confluent Cloud Kafka Clusters (Azure Primary Standard & DR Dedicated)
+#   * Primary: Standard cluster (elastic, pay-per-use) in East US
+#   * DR: Dedicated cluster (1 CKU, fixed capacity) in West US 2
+#   * Cluster Linking: Primary → DR with automatic replication
+#   * test_topic: Created on both clusters with automatic mirroring
 # - Schema Registry with Advanced Governance Package
 # - Confluent Gateway on Kubernetes
 # - All necessary certificates and secrets
@@ -207,7 +211,11 @@ EOF
 print_info "Initializing Terraform..."
 terraform init
 
-print_info "Deploying Confluent Cloud clusters with ACLs (this may take 5-10 minutes)..."
+print_info "Deploying Confluent Cloud resources (this may take 10-15 minutes)..."
+print_info "  - Primary Cluster: Standard (elastic, auto-scaling)"
+print_info "  - DR Cluster: Dedicated (1 CKU, fixed capacity)"
+print_info "  - Cluster Linking: Primary → DR with automatic replication"
+print_info "  - test_topic: Created on both clusters"
 print_warning "Note: ACL creation requires your Cloud API key to have OrganizationAdmin role"
 print_info "If ACL creation fails, see terraform/confluent-cloud/README.md"
 
@@ -301,7 +309,23 @@ echo ""
 make certs
 make k8s-secrets
 
-print_success "All certificates and secrets created successfully"
+print_info "Verifying Kubernetes secrets are created..."
+REQUIRED_SECRETS=("cc-primary-tls" "cc-dr-tls" "gateway-tls" "gateway-truststore" "client-primary" "client-dr")
+MISSING_SECRETS=()
+
+for secret in "${REQUIRED_SECRETS[@]}"; do
+    if ! kubectl get secret "$secret" -n confluent &>/dev/null; then
+        MISSING_SECRETS+=("$secret")
+    fi
+done
+
+if [ ${#MISSING_SECRETS[@]} -eq 0 ]; then
+    print_success "All Kubernetes secrets created successfully"
+else
+    print_error "Missing secrets: ${MISSING_SECRETS[*]}"
+    print_error "Re-running make k8s-secrets..."
+    make k8s-secrets
+fi
 
 # Verify certificates
 print_info "Verifying certificates..."
@@ -346,8 +370,18 @@ print_info "  - DR Cluster: ${DR_CLUSTER_ENDPOINT}"
 print_info "Deploying gateway..."
 kubectl apply -f kubernetes-resources/gateway.yaml -n confluent
 
-print_info "Waiting for gateway to be ready..."
+print_info "Waiting for gateway pods to be ready (this may take 2-3 minutes)..."
 kubectl wait --for=condition=Ready pod -l app=confluent-gateway --timeout=600s -n confluent
+
+print_info "Verifying gateway is healthy..."
+GATEWAY_POD=$(kubectl get pods -n confluent -l app=confluent-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+if [ -n "$GATEWAY_POD" ]; then
+    # Wait a bit for the gateway to fully initialize
+    sleep 10
+    print_success "Gateway pod ${GATEWAY_POD} is running and ready"
+else
+    print_warning "Could not verify gateway pod name, but deployment succeeded"
+fi
 
 print_success "Gateway deployed successfully"
 
@@ -357,23 +391,44 @@ print_success "Gateway deployed successfully"
 
 print_header "Step 7.5: Updating Azure Private DNS"
 
-# Get LoadBalancer IP
+# Get LoadBalancer IP with proper retry logic
 print_info "Waiting for LoadBalancer to be provisioned..."
-sleep 30  # Wait for LB to be provisioned
 
-LB_IP=$(kubectl get svc confluent-gateway-bootstrap-lb -n confluent \
-    -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+MAX_ATTEMPTS=60  # Wait up to 5 minutes (60 * 5 seconds)
+ATTEMPT=0
+LB_IP=""
+
+while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+    LB_IP=$(kubectl get svc confluent-gateway-bootstrap-lb -n confluent \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+
+    if [ -n "$LB_IP" ]; then
+        print_success "LoadBalancer IP assigned: ${LB_IP}"
+        break
+    fi
+
+    ATTEMPT=$((ATTEMPT + 1))
+    if [ $((ATTEMPT % 6)) -eq 0 ]; then
+        print_info "Still waiting for LoadBalancer IP... (${ATTEMPT}/60 attempts)"
+    fi
+    sleep 5
+done
 
 if [ -z "$LB_IP" ]; then
-    print_warning "LoadBalancer IP not available yet."
-    print_info "You can update the DNS record manually later with:"
-    print_info "  az network private-dns record-set a add-record \\"
-    print_info "    --resource-group ${RESOURCE_GROUP_NAME} \\"
-    print_info "    --zone-name ${DNS_ZONE_NAME:-axa.com} \\"
-    print_info "    --record-set-name ${GATEWAY_DNS_RECORD_NAME:-kafka.cc} \\"
-    print_info "    --ipv4-address <LOADBALANCER_IP>"
+    print_error "LoadBalancer IP not available after 5 minutes."
+    print_warning "This may indicate an issue with Azure LoadBalancer provisioning."
+    print_info "You can:"
+    print_info "  1. Check LoadBalancer status: kubectl get svc confluent-gateway-bootstrap-lb -n confluent"
+    print_info "  2. Check events: kubectl describe svc confluent-gateway-bootstrap-lb -n confluent"
+    print_info "  3. Update DNS record manually later with:"
+    print_info "     az network private-dns record-set a add-record \\"
+    print_info "       --resource-group ${RESOURCE_GROUP_NAME} \\"
+    print_info "       --zone-name ${DNS_ZONE_NAME:-axa.com} \\"
+    print_info "       --record-set-name ${GATEWAY_DNS_RECORD_NAME:-kafka.cc} \\"
+    print_info "       --ipv4-address <LOADBALANCER_IP>"
+    print_warning "Continuing without updating DNS..."
 else
-    print_success "LoadBalancer IP: ${LB_IP}"
+    print_success "LoadBalancer ready with IP: ${LB_IP}"
 
     # Delete CNAME record if it exists and create A record
     print_info "Updating Azure Private DNS A record..."

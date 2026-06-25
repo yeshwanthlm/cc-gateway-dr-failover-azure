@@ -147,15 +147,84 @@ output "terraform_managed_resources" {
 
     Infrastructure:
       ✓ Environment: ${confluent_environment.main.id}
-      ✓ Primary Cluster (Azure ${var.primary_cluster_region}): ${confluent_kafka_cluster.primary_cluster.id}
-      ✓ DR Cluster (Azure ${var.dr_cluster_region}): ${confluent_kafka_cluster.dr_cluster.id}
+      ✓ Primary Cluster (Azure ${var.primary_cluster_region}, Standard): ${confluent_kafka_cluster.primary_cluster.id}
+      ✓ DR Cluster (Azure ${var.dr_cluster_region}, Dedicated): ${confluent_kafka_cluster.dr_cluster.id}
       ✓ Schema Registry (Advanced, Public): ${data.confluent_schema_registry_cluster.main.id}
-      ✓ Service Accounts: 3 (Primary, DR, Schema Registry)
-      ✓ API Keys: 3 cluster-specific keys
+      ✓ Service Accounts: 4 (Primary, DR, Schema Registry, Cluster Link)
+      ✓ API Keys: 4 cluster-specific keys
+
+    Topics:
+      ✓ test_topic on Primary Cluster (independent, writable)
+      ✓ test_topic on DR Cluster (independent, writable)
+      ✓ mirrored_topic on Primary Cluster (source)
+
+    Cluster Linking:
+      ✓ Cluster Link: ${confluent_cluster_link.primary_to_dr.link_name}
+      ✓ Mirror Topic: mirrored_topic (Primary → DR, read-only on DR)
 
     Access Control (after bootstrap):
       ✓ Role Bindings: CloudClusterAdmin (Kafka), ResourceOwner (Schema Registry)
       ✓ Fully managed by Terraform
 
   EOT
+}
+
+# Cluster Linking Outputs
+output "cluster_link_name" {
+  description = "Cluster Link Name (Primary to DR)"
+  value       = confluent_cluster_link.primary_to_dr.link_name
+}
+
+output "cluster_link_id" {
+  description = "Cluster Link ID"
+  value       = confluent_cluster_link.primary_to_dr.id
+}
+
+output "cluster_link_status" {
+  description = "Cluster Link connection mode and direction"
+  value = {
+    link_name       = confluent_cluster_link.primary_to_dr.link_name
+    link_mode       = confluent_cluster_link.primary_to_dr.link_mode
+    connection_mode = confluent_cluster_link.primary_to_dr.connection_mode
+    source_cluster  = confluent_kafka_cluster.primary_cluster.id
+    destination_cluster = confluent_kafka_cluster.dr_cluster.id
+  }
+}
+
+# Topic Outputs
+output "test_topic_primary" {
+  description = "test_topic details on Primary cluster"
+  value = {
+    topic_name       = confluent_kafka_topic.test_topic_primary.topic_name
+    partitions_count = confluent_kafka_topic.test_topic_primary.partitions_count
+    cluster_id       = confluent_kafka_cluster.primary_cluster.id
+  }
+}
+
+output "test_topic_dr" {
+  description = "test_topic on DR cluster (regular topic, allows direct writes)"
+  value = {
+    topic_name       = confluent_kafka_topic.test_topic_dr.topic_name
+    partitions_count = confluent_kafka_topic.test_topic_dr.partitions_count
+    cluster_id       = confluent_kafka_cluster.dr_cluster.id
+  }
+}
+
+output "mirrored_topic_primary" {
+  description = "mirrored_topic on Primary cluster (source for cluster linking)"
+  value = {
+    topic_name       = confluent_kafka_topic.mirrored_topic_primary.topic_name
+    partitions_count = confluent_kafka_topic.mirrored_topic_primary.partitions_count
+    cluster_id       = confluent_kafka_cluster.primary_cluster.id
+  }
+}
+
+output "mirrored_topic_mirror" {
+  description = "mirrored_topic mirror on DR cluster (replicated via cluster linking)"
+  value = {
+    topic_name        = "mirrored_topic"
+    mirror_topic_name = confluent_kafka_mirror_topic.mirrored_topic_mirror.mirror_topic_name
+    cluster_id        = confluent_kafka_cluster.dr_cluster.id
+    status            = confluent_kafka_mirror_topic.mirrored_topic_mirror.status
+  }
 }

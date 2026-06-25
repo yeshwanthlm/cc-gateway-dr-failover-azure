@@ -6,7 +6,9 @@
 # This script automates the complete destruction of:
 # - Kubernetes resources (Gateway, Secrets, Pods)
 # - Confluent Operator (Helm)
-# - Confluent Cloud Kafka Clusters
+# - Confluent Cloud Kafka Clusters (Standard Primary + Dedicated DR)
+# - Cluster Linking and Mirror Topics
+# - Schema Registry
 # - Azure AKS Cluster and VNet
 # =============================================================================
 
@@ -54,8 +56,12 @@ print_header "Confluent Cloud Gateway Demo - Destruction"
 print_warning "This will destroy ALL resources including:"
 echo "  - Kubernetes Gateway and resources"
 echo "  - Confluent Operator (Helm)"
-echo "  - Confluent Cloud Kafka Clusters (Azure Primary & DR)"
-echo "  - Schema Registry"
+echo "  - Confluent Cloud Kafka Clusters:"
+echo "      • Primary (Standard) in East US"
+echo "      • DR (Dedicated, 1 CKU) in West US 2"
+echo "  - Cluster Linking (Primary → DR)"
+echo "  - Mirror Topics (test_topic)"
+echo "  - Schema Registry (Advanced package)"
 echo "  - Azure AKS Cluster and VNet"
 echo "  - Azure Resource Group (if empty)"
 echo ""
@@ -215,7 +221,11 @@ echo ""
 print_info "Destroyed resources:"
 echo "  ✓ Kubernetes Gateway and resources"
 echo "  ✓ Confluent Operator (Helm)"
-echo "  ✓ Confluent Cloud Kafka Clusters"
+echo "  ✓ Confluent Cloud Kafka Clusters:"
+echo "      • Primary (Standard) cluster"
+echo "      • DR (Dedicated) cluster"
+echo "  ✓ Cluster Linking and Mirror Topics"
+echo "  ✓ Schema Registry"
 echo "  ✓ Azure AKS Cluster and VNet"
 echo "  ✓ Azure Resource Group (if empty)"
 echo "  ✓ Temporary files and certificates"

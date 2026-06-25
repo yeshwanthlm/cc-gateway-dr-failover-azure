@@ -6,7 +6,7 @@ metadata:
 spec:
   restartPolicy: Never
   hostAliases:
-    - ip: "XX.XX.XXX.XXX"
+    - ip: "4.249.228.234"
       hostnames:
         - "kafka.cc.axa.com"
   securityContext:
